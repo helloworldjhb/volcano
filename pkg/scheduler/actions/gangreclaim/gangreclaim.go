@@ -252,7 +252,7 @@ func (gr *Action) selectDomainBundles(ssn *framework.Session, lessQueueFn func(l
 		Job:       reclaimerJob,
 		HyperNode: domain,
 	}
-	valid := utils.FilterOrderedBundles(bundles, gr.allowWholeBundle, func(tasks []*api.TaskInfo) []*api.TaskInfo {
+	valid := utils.FilterOrderedBundles(ssn, bundles, gr.allowWholeBundle, func(tasks []*api.TaskInfo) []*api.TaskInfo {
 		return ssn.UnifiedEvictable(evictCtx, tasks)
 	})
 	utils.SortBundlesForReclaim(valid, jobNeed, gr.victimOrderPolicy, lessQueueFn, ssn.Queues)

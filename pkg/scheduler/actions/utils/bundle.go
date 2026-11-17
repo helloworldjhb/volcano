@@ -21,6 +21,7 @@ import (
 	"sort"
 
 	"volcano.sh/volcano/pkg/scheduler/api"
+	"volcano.sh/volcano/pkg/scheduler/framework"
 )
 
 type BundleType int
@@ -223,28 +224,42 @@ func FlattenBundles(bundles []*Bundle) []*api.TaskInfo {
 	return out
 }
 
-// FilterOrderedBundles replays the accepted prefix for each candidate. A failed
-// Whole trial therefore cannot spend the allowance of later bundles. Filters
-// must evaluate each call against the unchanged session snapshot; replaying the
-// prefix preserves cumulative resource accounting across calls.
+// FilterOrderedBundles temporarily evicts accepted units so filters see cumulative
+// accounting without replaying candidates. Whole units require full approval.
+// All temporary evictions are discarded before returning the filtered bundles.
 // Safe bundles become single-task selection units so placement can stop early.
-func FilterOrderedBundles(bundles []*Bundle, allowWhole bool, filter func([]*api.TaskInfo) []*api.TaskInfo) []*Bundle {
-	var accepted []*api.TaskInfo
+func FilterOrderedBundles(ssn *framework.Session, bundles []*Bundle, allowWhole bool, filter func([]*api.TaskInfo) []*api.TaskInfo) []*Bundle {
+	stmt := framework.NewStatement(ssn)
+	previousTransactions := make(map[*api.TaskInfo]*api.TransactionContext)
+	defer func() {
+		stmt.Discard()
+		// Filtering must not leave Discard's speculative transaction metadata.
+		for task, previous := range previousTransactions {
+			task.LastTransaction = previous
+			if node := ssn.Nodes[task.NodeName]; node != nil {
+				if taskOnNode := node.Tasks[api.PodKey(task.Pod)]; taskOnNode != nil {
+					taskOnNode.LastTransaction = previous.Clone()
+				}
+			}
+		}
+	}()
 	var result []*Bundle
 	try := func(b *Bundle) {
-		trial := make([]*api.TaskInfo, 0, len(accepted)+len(b.Tasks))
-		trial = append(trial, accepted...)
-		trial = append(trial, b.Tasks...)
-		allowed := make(map[api.TaskID]bool, len(trial))
-		for _, task := range filter(trial) {
+		allowed := make(map[api.TaskID]bool, len(b.Tasks))
+		for _, task := range filter(b.Tasks) {
 			allowed[task.UID] = true
 		}
-		for _, task := range trial {
+		for _, task := range b.Tasks {
 			if !allowed[task.UID] {
 				return
 			}
 		}
-		accepted = trial
+		for _, task := range b.Tasks {
+			// Candidates may be copies; retain the session task's transaction fields.
+			task = ssn.Jobs[task.Job].Tasks[task.UID]
+			previousTransactions[task] = task.LastTransaction
+			stmt.Evict(task, "gang-victim-filter")
+		}
 		result = append(result, b)
 	}
 	for _, b := range bundles {

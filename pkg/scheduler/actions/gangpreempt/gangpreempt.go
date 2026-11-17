@@ -251,7 +251,7 @@ func (gp *Action) selectDomainBundles(ssn *framework.Session, preemptorJob *api.
 		Job:       preemptorJob,
 		HyperNode: domain,
 	}
-	valid := utils.FilterOrderedBundles(bundles, gp.allowWholeBundle, func(tasks []*api.TaskInfo) []*api.TaskInfo {
+	valid := utils.FilterOrderedBundles(ssn, bundles, gp.allowWholeBundle, func(tasks []*api.TaskInfo) []*api.TaskInfo {
 		return ssn.UnifiedEvictable(evictCtx, tasks)
 	})
 	utils.SortBundlesForPreempt(valid, jobNeed, gp.victimOrderPolicy, func(l, r *api.JobInfo) bool {

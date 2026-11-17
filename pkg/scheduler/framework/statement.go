@@ -45,9 +45,10 @@ const (
 )
 
 type operation struct {
-	name   Operation
-	task   *api.TaskInfo
-	reason string
+	name           Operation
+	task           *api.TaskInfo
+	reason         string
+	originalStatus api.TaskStatus
 }
 
 // Statement structure
@@ -80,8 +81,13 @@ func (s *Statement) HasEvictions() bool {
 
 // Evict the pod
 func (s *Statement) Evict(reclaimee *api.TaskInfo, reason string) {
+	originalStatus := reclaimee.Status
 	// Update status in session
 	if job, found := s.ssn.Jobs[reclaimee.Job]; found {
+		// Recovered plans carry Releasing copies; use the current session status.
+		if task, found := job.Tasks[reclaimee.UID]; found {
+			originalStatus = task.Status
+		}
 		job.UpdateTaskStatus(reclaimee, api.Releasing)
 	} else {
 		klog.Errorf("Failed to find Job <%s> in Session <%s> index when evicting.",
@@ -103,15 +109,16 @@ func (s *Statement) Evict(reclaimee *api.TaskInfo, reason string) {
 	}
 
 	s.operations = append(s.operations, operation{
-		name:   Evict,
-		task:   reclaimee,
-		reason: reason,
+		name:           Evict,
+		task:           reclaimee,
+		reason:         reason,
+		originalStatus: originalStatus,
 	})
 }
 
-func (s *Statement) evict(reclaimee *api.TaskInfo, reason string) error {
+func (s *Statement) evict(reclaimee *api.TaskInfo, reason string, originalStatus api.TaskStatus) error {
 	if err := s.ssn.cache.Evict(reclaimee, reason); err != nil {
-		if e := s.unevict(reclaimee); e != nil {
+		if e := s.unevict(reclaimee, originalStatus); e != nil {
 			klog.Errorf("Faled to unevict task <%v/%v>: %v.", reclaimee.Namespace, reclaimee.Name, e)
 		}
 		return err
@@ -120,11 +127,11 @@ func (s *Statement) evict(reclaimee *api.TaskInfo, reason string) error {
 	return nil
 }
 
-func (s *Statement) unevict(reclaimee *api.TaskInfo) error {
+func (s *Statement) unevict(reclaimee *api.TaskInfo, originalStatus api.TaskStatus) error {
 	// Update status in session
 	job, found := s.ssn.Jobs[reclaimee.Job]
 	if found {
-		job.UpdateTaskStatus(reclaimee, api.Running)
+		job.UpdateTaskStatus(reclaimee, originalStatus)
 	} else {
 		klog.Errorf("Failed to find Job <%s> in Session <%s> index when unevicting.",
 			reclaimee.Job, s.ssn.UID)
@@ -379,7 +386,7 @@ func (s *Statement) Discard() {
 		op.task.GenerateLastTxContext()
 		switch op.name {
 		case Evict:
-			err := s.unevict(op.task)
+			err := s.unevict(op.task, op.originalStatus)
 			if err != nil {
 				klog.Errorf("Failed to unevict task: %s", err.Error())
 			}
@@ -405,7 +412,7 @@ func (s *Statement) Commit() {
 		op.task.ClearLastTxContext()
 		switch op.name {
 		case Evict:
-			err := s.evict(op.task, op.reason)
+			err := s.evict(op.task, op.reason, op.originalStatus)
 			if err != nil {
 				klog.Errorf("Failed to evict task: %s", err.Error())
 			}
@@ -445,9 +452,10 @@ func SaveOperations(stmts ...*Statement) *Statement {
 			task := op.task.Clone()
 			task.EvictionOccurred = op.task.EvictionOccurred
 			stmtTmp.operations = append(stmtTmp.operations, operation{
-				name:   op.name,
-				task:   task,
-				reason: op.reason,
+				name:           op.name,
+				task:           task,
+				reason:         op.reason,
+				originalStatus: op.originalStatus,
 			})
 		}
 	}

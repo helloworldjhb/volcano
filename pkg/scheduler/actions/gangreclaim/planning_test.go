@@ -73,6 +73,16 @@ func TestGangReclaimOrder_RejectedWholeLeavesAllowanceForSafe(t *testing.T) {
 				ssn.RealNodesList[framework.ClusterTopHyperNode] = []*api.NodeInfo{ssn.Nodes["n1"]}
 				action := New()
 				action.victimOrderPolicy, action.allowWholeBundle = policy, allowWhole
+				pending := actionutils.CollectPendingTasksForGangEviction(ssn, target)
+				for attempt := 0; attempt < 2; attempt++ {
+					valid := action.selectDomainBundles(ssn, queueLessFn(ssn, target.Queue), target, pending, actionutils.SumInitResreq(pending), framework.ClusterTopHyperNode)
+					victims := actionutils.FlattenBundles(valid)
+					require.Len(t, victims, 1, "filtering must restore capacity allowance for the next attempt")
+					assert.Equal(t, higher.UID, victims[0].Job)
+					assert.Equal(t, float64(2000), higher.Allocated.MilliCPU)
+					assert.Equal(t, float64(2000), low.Allocated.MilliCPU)
+					assert.True(t, ssn.Nodes["n1"].Releasing.IsEmpty())
+				}
 				stmt := framework.NewStatement(ssn)
 				defer stmt.Discard()
 				// The victim queue can spare only one CPU: the low-priority

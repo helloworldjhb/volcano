@@ -27,7 +27,91 @@ import (
 	"volcano.sh/volcano/pkg/scheduler/conf"
 	"volcano.sh/volcano/pkg/scheduler/framework"
 	"volcano.sh/volcano/pkg/scheduler/plugins/util"
+	schedulerutil "volcano.sh/volcano/pkg/scheduler/util"
 )
+
+func bundleFilterSession(t testing.TB, tasks ...*api.TaskInfo) *framework.Session {
+	t.Helper()
+	ensureServerOptsForTest()
+	node := api.NewNodeInfo(schedulerutil.BuildNode("n1", api.BuildResourceList(fmt.Sprint(len(tasks)), "0", api.ScalarResource{Name: "pods", Value: fmt.Sprint(len(tasks) + 10)}), nil))
+	ssn := &framework.Session{Jobs: map[api.JobID]*api.JobInfo{}, Nodes: map[string]*api.NodeInfo{node.Name: node}}
+	for _, task := range tasks {
+		if task.Job == "" {
+			task.Job = "job"
+		}
+		if task.Pod == nil {
+			task.Pod = makeTask(task.Job, string(task.UID)).Pod
+		}
+		if task.InitResreq == nil {
+			task.InitResreq = task.Resreq.Clone()
+		}
+		if task.NumaInfo == nil {
+			task.NumaInfo = &api.TopologyInfo{}
+		}
+		if task.Status != api.Bound {
+			task.Status = api.Running
+		}
+		task.NodeName = node.Name
+		if ssn.Jobs[task.Job] == nil {
+			ssn.Jobs[task.Job] = api.NewJobInfo(task.Job)
+		}
+		ssn.Jobs[task.Job].AddTaskInfo(task)
+		require.NoError(t, node.AddTask(task))
+	}
+	return ssn
+}
+
+func TestFilterOrderedBundles_VisitsEachCandidateOnceAndRestoresState(t *testing.T) {
+	for _, status := range []api.TaskStatus{api.Running, api.Bound} {
+		t.Run(status.String(), func(t *testing.T) {
+			tasks := []*api.TaskInfo{makeTask("job", "a"), makeTask("job", "b"), makeTask("job", "c")}
+			for _, task := range tasks {
+				task.Status = status
+			}
+			tasks[0].LastTransaction = &api.TransactionContext{Status: api.Allocated, NodeName: "previous"}
+			tasks[0].JobAllocatedHyperNode = "existing-domain"
+			tasks[0].EvictionOccurred = true
+			ssn := bundleFilterSession(t, tasks...)
+			job, node := ssn.Jobs["job"], ssn.Nodes["n1"]
+			allocated, used, idle := job.Allocated.Clone(), node.Used.Clone(), node.Idle.Clone()
+			last := tasks[0].LastTransaction.Clone()
+			deallocated, reallocated := 0, 0
+			ssn.AddEventHandler(&framework.EventHandler{
+				DeallocateFunc: func(event *framework.Event) { deallocated++ },
+				AllocateFunc: func(event *framework.Event) {
+					reallocated++
+					assert.Equal(t, status, event.Task.Status)
+				},
+			})
+			calls, processed := 0, 0
+			candidates := []*api.TaskInfo{tasks[0].Clone(), tasks[1].Clone(), tasks[2].Clone()}
+			valid := FilterOrderedBundles(ssn, []*Bundle{{Type: BundleSafe, Tasks: candidates}}, false, func(trial []*api.TaskInfo) []*api.TaskInfo {
+				assert.Equal(t, float64(3000-calls*1000), job.Allocated.MilliCPU)
+				calls++
+				processed += len(trial)
+				return trial
+			})
+			assert.Equal(t, candidates, FlattenBundles(valid))
+			assert.Equal(t, 3, processed, "accepted tasks must not be replayed")
+			assert.Equal(t, 3, deallocated)
+			assert.Equal(t, deallocated, reallocated)
+			assert.Equal(t, allocated, job.Allocated)
+			assert.Equal(t, used, node.Used)
+			assert.Equal(t, idle, node.Idle)
+			assert.True(t, node.Releasing.IsEmpty())
+			for _, task := range tasks {
+				assert.Equal(t, status, task.Status)
+				assert.Equal(t, status, job.Tasks[task.UID].Status)
+				assert.Equal(t, status, node.Tasks[api.PodKey(task.Pod)].Status)
+			}
+			assert.Equal(t, last, job.Tasks[tasks[0].UID].LastTransaction)
+			assert.Equal(t, last, node.Tasks[api.PodKey(tasks[0].Pod)].LastTransaction)
+			assert.Nil(t, job.Tasks[tasks[1].UID].LastTransaction)
+			assert.Equal(t, "existing-domain", job.Tasks[tasks[0].UID].JobAllocatedHyperNode)
+			assert.True(t, job.Tasks[tasks[0].UID].EvictionOccurred)
+		})
+	}
+}
 
 func TestSafeTaskPrioritySurvivesSecondSort(t *testing.T) {
 	for _, action := range []string{"preempt", "reclaim"} {
@@ -43,7 +127,8 @@ func TestSafeTaskPrioritySurvivesSecondSort(t *testing.T) {
 						high.Priority = low.Priority
 						want = high.UID // UID breaks ties only after task priority.
 					}
-					job := api.NewJobInfo("job", low, high, core)
+					ssn := bundleFilterSession(t, low, high, core)
+					job := ssn.Jobs["job"]
 					job.MinAvailable, job.Queue = 1, "queue"
 					need := &api.Resource{MilliCPU: 1000}
 					queues := map[api.QueueID]*api.QueueInfo{"queue": {UID: "queue"}}
@@ -57,7 +142,7 @@ func TestSafeTaskPrioritySurvivesSecondSort(t *testing.T) {
 					bundles := CreateJobBundles(job, []*api.TaskInfo{core, high, low})
 					sortBundles(bundles)
 					require.Equal(t, want, bundles[0].Tasks[0].UID)
-					valid := FilterOrderedBundles(bundles, false, func(tasks []*api.TaskInfo) []*api.TaskInfo { return tasks })
+					valid := FilterOrderedBundles(ssn, bundles, false, func(tasks []*api.TaskInfo) []*api.TaskInfo { return tasks })
 					require.Len(t, valid, 2)
 					require.Equal(t, want, valid[0].Tasks[0].UID)
 					sortBundles(valid)
@@ -73,21 +158,22 @@ func TestSafeTaskPrioritySurvivesSecondSort(t *testing.T) {
 func BenchmarkFilterOrderedBundles(b *testing.B) {
 	for _, count := range []int{32, 128, 512} {
 		b.Run(fmt.Sprint(count), func(b *testing.B) {
-			ssn := &framework.Session{Tiers: []conf.Tier{{Plugins: []conf.PluginOption{{Name: "first"}, {Name: "second"}}}}}
+			tasks := make([]*api.TaskInfo, count)
+			for i := range tasks {
+				tasks[i] = makeTask("job", fmt.Sprint(i))
+			}
+			ssn := bundleFilterSession(b, tasks...)
+			ssn.Tiers = []conf.Tier{{Plugins: []conf.PluginOption{{Name: "first"}, {Name: "second"}}}}
 			for _, name := range []string{"first", "second"} {
 				ssn.AddUnifiedEvictableFn(name, func(_ *api.EvictionContext, tasks []*api.TaskInfo) ([]*api.TaskInfo, int) {
 					return tasks, util.Permit
 				})
 			}
-			tasks := make([]*api.TaskInfo, count)
-			for i := range tasks {
-				tasks[i] = &api.TaskInfo{UID: api.TaskID(fmt.Sprint(i)), Resreq: &api.Resource{MilliCPU: 1000}}
-			}
 			bundles := []*Bundle{{Type: BundleSafe, Tasks: tasks}}
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				FilterOrderedBundles(bundles, true, func(trial []*api.TaskInfo) []*api.TaskInfo {
+				FilterOrderedBundles(ssn, bundles, true, func(trial []*api.TaskInfo) []*api.TaskInfo {
 					return ssn.UnifiedEvictable(&api.EvictionContext{}, trial)
 				})
 			}
@@ -160,8 +246,9 @@ func TestFilterOrderedBundles_WholeDoesNotConsumeRejectedAllowance(t *testing.T)
 		{Type: BundleSafe, Tasks: []*api.TaskInfo{later}},
 	}
 	for _, allowWhole := range []bool{false, true} {
-		// Each invocation evaluates cumulative victims against the same quota
-		// snapshot. Only two tasks may be reclaimed in total.
+		ssn := bundleFilterSession(t, first, w1, w2, later)
+		// Only two tasks may be reclaimed in total. Accepted evictions update
+		// the session; a partially approved Whole must not spend the remainder.
 		filter := func(tasks []*api.TaskInfo) []*api.TaskInfo {
 			if !allowWhole {
 				for _, candidate := range tasks {
@@ -169,13 +256,15 @@ func TestFilterOrderedBundles_WholeDoesNotConsumeRejectedAllowance(t *testing.T)
 					assert.NotEqual(t, w2.UID, candidate.UID)
 				}
 			}
-			if len(tasks) > 2 {
-				return tasks[:2]
+			remaining := int(ssn.Jobs["job"].Allocated.MilliCPU/1000) - 2
+			if len(tasks) > remaining {
+				return tasks[:remaining]
 			}
 			return tasks
 		}
-		valid := FilterOrderedBundles(bundles, allowWhole, filter)
+		valid := FilterOrderedBundles(ssn, bundles, allowWhole, filter)
 		assert.Equal(t, []*api.TaskInfo{first, later}, FlattenBundles(valid))
+		assert.Equal(t, float64(4000), ssn.Jobs["job"].Allocated.MilliCPU)
 	}
 }
 
@@ -186,14 +275,15 @@ func TestFilterOrderedBundles_SafeSelectionIsIncremental(t *testing.T) {
 		{UID: "s3", Resreq: &api.Resource{MilliCPU: 1000}},
 	}
 	bundles := []*Bundle{{Type: BundleSafe, Tasks: tasks, LocalRes: sumTasks(tasks)}}
-	valid := FilterOrderedBundles(bundles, true, func(tasks []*api.TaskInfo) []*api.TaskInfo { return tasks })
+	ssn := bundleFilterSession(t, tasks...)
+	valid := FilterOrderedBundles(ssn, bundles, true, func(tasks []*api.TaskInfo) []*api.TaskInfo { return tasks })
 	assert.Len(t, valid, 3)
 	selected := SelectBundles(valid, &api.Resource{MilliCPU: 1000}, true)
 	assert.Equal(t, tasks[:1], FlattenBundles(selected), "one required task must not evict all surplus")
 	assert.Len(t, bundles[0].Tasks, 3, "do not mutate raw bundles")
 }
 
-func TestFilterOrderedBundles_KeepsWholeAtomicAndReplaysPrefix(t *testing.T) {
+func TestFilterOrderedBundles_KeepsWholeAtomicAndAccountsAcceptedVictims(t *testing.T) {
 	tasks := []*api.TaskInfo{
 		{UID: "w1", Resreq: &api.Resource{MilliCPU: 1000}},
 		{UID: "w2", Resreq: &api.Resource{MilliCPU: 1000}},
@@ -203,9 +293,11 @@ func TestFilterOrderedBundles_KeepsWholeAtomicAndReplaysPrefix(t *testing.T) {
 		{Type: BundleWhole, Tasks: tasks[:2], LocalRes: sumTasks(tasks[:2])},
 		{Type: BundleSafe, Tasks: tasks[2:]},
 	}
-	valid := FilterOrderedBundles(bundles, true, func(trial []*api.TaskInfo) []*api.TaskInfo {
-		if len(trial) > 2 {
-			return trial[:2]
+	ssn := bundleFilterSession(t, tasks...)
+	valid := FilterOrderedBundles(ssn, bundles, true, func(trial []*api.TaskInfo) []*api.TaskInfo {
+		remaining := int(ssn.Jobs["job"].Allocated.MilliCPU/1000) - 1
+		if len(trial) > remaining {
+			return trial[:remaining]
 		}
 		return trial
 	})

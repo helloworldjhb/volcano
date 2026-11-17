@@ -66,7 +66,7 @@ type EvictionContext struct {
 type UnifiedEvictableFn func(ctx *EvictionContext, candidates []*TaskInfo) ([]*TaskInfo, int)
 ```
 
-Gang actions can replay cumulative candidate prefixes. Each invocation must evaluate the complete input against the unchanged session snapshot without persisting trial accounting. Rejected trials are omitted from subsequent prefixes.
+Each invocation evaluates the complete input against the current session without persisting its own trial accounting. Gang actions temporarily apply fully accepted units through a Statement, so subsequent calls see updated accounting without replaying accepted candidates. Rejected units cause no state changes; the Statement is discarded after filtering.
 
 #### Pros
 

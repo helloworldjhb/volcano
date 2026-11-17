@@ -19,6 +19,7 @@ package framework
 import (
 	"testing"
 
+	"github.com/stretchr/testify/require"
 	v1 "k8s.io/api/core/v1"
 
 	schedulingv1 "volcano.sh/apis/pkg/apis/scheduling/v1beta1"
@@ -26,6 +27,47 @@ import (
 	"volcano.sh/volcano/pkg/scheduler/cache"
 	"volcano.sh/volcano/pkg/scheduler/util"
 )
+
+func TestEvictDiscardRestoresOriginalStatus(t *testing.T) {
+	for _, status := range []api.TaskStatus{api.Running, api.Bound} {
+		t.Run(status.String(), func(t *testing.T) {
+			ssn, job, task, node := newTestSession(t)
+			task.NodeName = node.Name
+			job.UpdateTaskStatus(task, status)
+			require.NoError(t, node.AddTask(task))
+			used, idle := node.Used.Clone(), node.Idle.Clone()
+			balance := 0
+			ssn.AddEventHandler(&EventHandler{
+				DeallocateFunc: func(event *Event) { balance-- },
+				AllocateFunc: func(event *Event) {
+					balance++
+					require.Equal(t, status, event.Task.Status)
+				},
+			})
+			stmt := NewStatement(ssn)
+			stmt.Evict(task.Clone(), "test")
+			plan := SaveOperations(stmt)
+			require.Equal(t, api.Releasing, job.Tasks[task.UID].Status)
+			stmt.Discard()
+			require.Equal(t, status, job.Tasks[task.UID].Status)
+			require.Equal(t, status, node.Tasks[api.PodKey(task.Pod)].Status)
+			require.Zero(t, balance)
+			require.Equal(t, used, node.Used)
+			require.Equal(t, idle, node.Idle)
+			require.True(t, node.Releasing.IsEmpty())
+
+			// Saved plans contain Releasing task copies; recovery must capture
+			// the current session status rather than the saved copy's status.
+			require.NoError(t, stmt.RecoverOperations(plan))
+			stmt.Discard()
+			require.Equal(t, status, job.Tasks[task.UID].Status)
+			require.Equal(t, status, node.Tasks[api.PodKey(task.Pod)].Status)
+			require.Zero(t, balance)
+			require.Equal(t, used, node.Used)
+			require.Equal(t, idle, node.Idle)
+		})
+	}
+}
 
 func TestStatementHasEvictions(t *testing.T) {
 	task := &api.TaskInfo{Name: "task"}

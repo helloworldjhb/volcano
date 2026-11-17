@@ -106,7 +106,7 @@ For each pending preemptor gang, the action starts by fetching ordered topology 
 
 Inside each HyperNode, victim selection is based on the HyperNode-wide footprint of candidate jobs. Candidate tasks are grouped into bundles per job:
 
-Safe bundles are split into single-task selection units after filtering; Whole bundles remain atomic decisions. "Whole" refers to the candidate core tasks in this HyperNode, not necessarily every pod of the job across the cluster.
+Safe bundles are split into single-task selection units during filtering; Whole bundles remain atomic decisions. "Whole" refers to the candidate core tasks in this HyperNode, not necessarily every pod of the job across the cluster.
 
 - A safe bundle contains surplus tasks, or tasks from gangs already below their effective availability target.
 - A whole bundle contains core tasks whose eviction implies breaking the gang.
@@ -115,9 +115,9 @@ Each candidate task belongs to either Safe or Whole. Their relative order is con
 
 Bundle ordering is performed in two passes for each HyperNode.
 
-In the first pass, the scheduler sorts raw bundles, skips Whole when disabled, and evaluates candidates through `UnifiedEvictable`. Every trial contains the already accepted prefix plus one Safe task or an entire Whole bundle. A trial is accepted only if all its tasks remain eligible. Rejected trials do not enter the next prefix, so partially approved Whole bundles cannot consume later Safe candidates' allowance.
+In the first pass, the scheduler sorts raw bundles, skips Whole when disabled, and evaluates one Safe task or an entire Whole bundle through `UnifiedEvictable`. Only fully approved units are evicted in a temporary Statement. Subsequent filter calls see those accepted evictions through the updated session and plugin accounting. Partially approved Whole bundles cause no state changes and cannot consume later Safe candidates' allowance.
 
-Each filter invocation evaluates an unchanged session snapshot. Replaying the prefix preserves the existing plugins' cumulative quota checks without persisting rejected trials. Replay can evaluate a quadratic number of candidate entries; plugins must not mutate session state during filtering. Plugin-result intersection preserves order and is linear per call.
+Each candidate is submitted once, without replaying the accepted prefix. Plugins evaluate each call against the current session without persisting their own trial accounting. The temporary Statement is discarded before returning the filtered bundles, restoring task states and accounting. Filtering still visits all candidates before placement; plugin-result intersection preserves order and is linear per call.
 
 In the second pass, the scheduler re-sorts the rebuilt bundle list before final selection. This second sort is required because plugin filtering can remove or shrink bundles, which changes their effective value and relative priority.
 
@@ -134,7 +134,7 @@ flowchart TB
     S([Start pending preemptor]) --> H[Get HyperNodes with PurposeEvict]
     H --> L{Next HyperNode}
     L --> B[Build and rank bundles]
-    B --> F[Cumulative-prefix plugin trials]
+    B --> F[Filter with temporary Statement, then discard]
     F --> R[Rebuild bundles and second-pass sort]
     R --> P{Select bundles + simulate placement}
     P -- Success --> C[Evict + nominate transaction]
@@ -219,19 +219,22 @@ def select_gang_victims_in_hypernode(preemptor, hypernode, candidates, ssn):
         if whole_bundle:
             bundles.append(whole_bundle)
 
-    # Phase 2: first-pass sort and cumulative-prefix filtering.
+    # Phase 2: first-pass sort and temporary-statement filtering.
     bundles = sort_bundles(bundles, preemptor, victim_order_policy)
-    accepted = []
     valid = []
-    for b in bundles:
-        if b.is_whole() and not allow_whole_bundle:
-            continue
-        for unit in ([b] if b.is_whole() else single_task_units(b)):
-            trial = accepted + unit.tasks
-            allowed = unified_evictable(eviction_context, trial)
-            if all(t in allowed for t in trial):
-                accepted = trial
-                valid.append(unit)
+    trial = new_statement(ssn)
+    try:
+        for b in bundles:
+            if b.is_whole() and not allow_whole_bundle:
+                continue
+            for unit in ([b] if b.is_whole() else single_task_units(b)):
+                allowed = unified_evictable(eviction_context, unit.tasks)
+                if all(t in allowed for t in unit.tasks):
+                    for task in unit.tasks:
+                        trial.evict(task)
+                    valid.append(unit)
+    finally:
+        trial.discard()
 
     # Phase 3: second-pass sort, then incremental select + simulate.
     valid = sort_bundles(valid, preemptor, victim_order_policy)
@@ -268,8 +271,8 @@ Phase 1 implements the core gang-aware eviction path end to end.
 - Update `network-topology-aware` to honor purpose-specific ordering: keep allocation-oriented behavior for `PurposeAllocate`, and use eviction-oriented ordering for `PurposeEvict`.
 - Add dedicated `gangPreempt` and `gangReclaim` actions, and wire them into action configuration and execution.
 - Extract reusable placement logic from `allocate` so post-eviction simulation in gang-aware actions uses the same placement semantics.
-- Add bundle splitting, queue-local policy sorting, cumulative-prefix filtering, and incremental selection. Gang actions use `UnifiedEvictableFn`; legacy task-level eviction retains its existing hooks.
+- Add bundle splitting, queue-local policy sorting, temporary-statement filtering, and incremental selection. Gang actions use `UnifiedEvictableFn`; legacy task-level eviction retains its existing hooks.
 
 ## Future Work
 
-Future work can optimize filtering costs and extend comparator policy through a plugin hook.
+Future work can stop filtering when a feasible placement is found and extend comparator policy through a plugin hook.
