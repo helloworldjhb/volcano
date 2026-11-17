@@ -66,6 +66,8 @@ type EvictionContext struct {
 type UnifiedEvictableFn func(ctx *EvictionContext, candidates []*TaskInfo) ([]*TaskInfo, int)
 ```
 
+Each invocation evaluates the complete input against the current session without persisting its own trial accounting. Gang actions temporarily apply fully accepted units through a Statement, so subsequent calls see updated accounting without replaying accepted candidates. Rejected units cause no state changes; the Statement is discarded after filtering.
+
 #### Pros
 
 * `EvictionKind` states gang vs legacy preempt/reclaim directly in the context, and `EvictionContext` groups job, task, pending tasks, and hypernode so job-oriented gang eviction does not depend on one representative task for all plugins.
